@@ -9,6 +9,8 @@ import type {
   AgentSessionContext,
   ActiveClientTools,
   AgentTurnSink,
+  ResumableAgentProvider,
+  ResumableAgentSessionContext,
 } from '@wyrd-company/ahp-provider-kit';
 import { ActiveClientToolsMcpBridge } from './active-client-tools-mcp-bridge.js';
 import {
@@ -42,7 +44,7 @@ export interface ClaudeAgentSdkProviderOptions {
   readonly env?: ClaudeAgentSdkOptions['env'];
 }
 
-export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOptions = {}): AgentProvider {
+export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOptions = {}): ResumableAgentProvider {
   const providerId = options.providerId ?? 'claude-agent-sdk';
   const defaultModel = options.defaultModel ?? 'default';
   const agent: AgentInfo = singleModelAgentInfo({
@@ -52,28 +54,35 @@ export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOpti
     defaultModel,
   });
 
+  function createRuntimeSession(context: AgentSessionContext): AgentSession {
+    const client = options.client ?? options.clientFactory?.() ?? new AnthropicClaudeAgentSdkClient();
+    const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
+    const activeClientToolsMcpBridge = new ActiveClientToolsMcpBridge({
+      name: `${providerId}-active-client-tools`,
+      sink: context.activeClientToolSink,
+    });
+    activeClientToolsMcpBridge.setActiveClientTools(context.activeClientTools);
+    return new ClaudeAgentSdkAHPAgentSession(client, {
+      cwd,
+      model: resolveModelId(context.model, options.defaultModel),
+      pathToClaudeCodeExecutable: options.pathToClaudeCodeExecutable,
+      permissionMode: options.permissionMode ?? 'dontAsk',
+      allowedTools: options.allowedTools,
+      disallowedTools: options.disallowedTools,
+      tools: options.tools,
+      mcpServers: options.mcpServers,
+      env: options.env,
+      activeClientToolsMcpBridge,
+    });
+  }
+
   return {
     agent,
     createSession(context: AgentSessionContext): AgentSession {
-      const client = options.client ?? options.clientFactory?.() ?? new AnthropicClaudeAgentSdkClient();
-      const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
-      const activeClientToolsMcpBridge = new ActiveClientToolsMcpBridge({
-        name: `${providerId}-active-client-tools`,
-        sink: context.activeClientToolSink,
-      });
-      activeClientToolsMcpBridge.setActiveClientTools(context.activeClientTools);
-      return new ClaudeAgentSdkAHPAgentSession(client, {
-        cwd,
-        model: resolveModelId(context.model, options.defaultModel),
-        pathToClaudeCodeExecutable: options.pathToClaudeCodeExecutable,
-        permissionMode: options.permissionMode ?? 'dontAsk',
-        allowedTools: options.allowedTools,
-        disallowedTools: options.disallowedTools,
-        tools: options.tools,
-        mcpServers: options.mcpServers,
-        env: options.env,
-        activeClientToolsMcpBridge,
-      });
+      return createRuntimeSession(context);
+    },
+    resumeSession(context: ResumableAgentSessionContext): AgentSession {
+      return createRuntimeSession(context);
     },
   };
 }

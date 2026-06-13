@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, test } from 'node:test';
 
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
@@ -8,6 +11,7 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 
 import {
   AhpServer,
+  FileSystemSessionStore,
   createInMemoryTransportPair,
 } from '@wyrd-company/ahp-server';
 import {
@@ -163,6 +167,67 @@ test('Claude Agent SDK provider exposes active-client tools through Streamable H
   await mcpClient.close();
   await client.request('disposeSession', { channel: sessionUri });
   await client.shutdown();
+});
+
+test('Claude Agent SDK provider resumes a persisted AHP session by recreating its SDK query session', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-claude-resume-'));
+  const firstClaude = new FakeClaudeAgentSdkClient([resultSuccess()]);
+  const secondClaude = new FakeClaudeAgentSdkClient([
+    streamDelta('Resumed '),
+    streamDelta('Claude'),
+    resultSuccess(),
+  ]);
+  const sessionUri = 'ahp-session:/claude-resume';
+
+  try {
+    const firstServer = new AhpServer({
+      providers: [createClaudeAgentSdkProvider({ client: firstClaude, defaultModel: 'claude-test' })],
+      store: new FileSystemSessionStore({ directory }),
+    });
+    const firstClient = createClient(firstServer);
+    firstClient.connect();
+    await firstClient.initialize({ clientId: 'claude-client', protocolVersions: ['0.3.0'] });
+    await firstClient.request('createSession', {
+      channel: sessionUri,
+      provider: 'claude-agent-sdk',
+      workingDirectory: 'file:///workspaces/project-a',
+      model: { id: 'claude-test' },
+    });
+    await firstClient.shutdown();
+
+    const secondServer = new AhpServer({
+      providers: [createClaudeAgentSdkProvider({ client: secondClaude, defaultModel: 'claude-test' })],
+      store: new FileSystemSessionStore({ directory }),
+    });
+    const secondClient = createClient(secondServer);
+    secondClient.connect();
+
+    const reconnect = await secondClient.reconnect({
+      clientId: 'claude-client',
+      lastSeenServerSeq: 0,
+      subscriptions: [sessionUri],
+    });
+    assert.equal(reconnect.type, 'snapshot');
+    assert.equal(secondClaude.options.length, 0);
+
+    const subscription = secondClient.attachSubscription(sessionUri);
+    secondClient.dispatch(sessionUri, {
+      type: 'session/turnStarted',
+      turnId: 'resume-turn',
+      message: userMessage('Continue after reconnect'),
+    } as StateAction);
+
+    const actions = await collectUntilTerminal(subscription);
+    assert.equal(secondClaude.prompts[0], 'Continue after reconnect');
+    assert.equal(secondClaude.options[0]?.cwd, '/workspaces/project-a');
+    assert.equal(secondClaude.options[0]?.model, 'claude-test');
+    assert.equal(actions.at(-1)?.type, 'session/turnComplete');
+
+    await secondClient.request('disposeSession', { channel: sessionUri });
+    await secondClient.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 class FakeClaudeAgentSdkClient implements ClaudeAgentSdkClient {
@@ -355,6 +420,12 @@ function toolDefinition(name: string, title: string): ToolDefinition {
       required: ['query'],
     },
   };
+}
+
+function createClient(server: AhpServer): AhpClient {
+  const [clientTransport, serverTransport] = createInMemoryTransportPair();
+  runningServers.push(server.accept(serverTransport));
+  return new AhpClient(clientTransport, { requestTimeoutMs: 1_000 });
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reject: (error: Error) => void } {

@@ -26,6 +26,17 @@ The provider maps AHP active-client tools to a per-session local Streamable HTTP
 - AHP owns session URI, turn id, tool call id, tool name, and active-client identity. Tool input is passed through as display/input data only.
 - Only the active client that owns the tool call can complete it through normal AHP `session/toolCallComplete`.
 
+## Session Resume
+
+The provider implements `ResumableAgentProvider`. When `ahp-server` reloads a
+persisted AHP session, the adapter recreates the Claude Agent SDK session wrapper
+from the stored AHP working directory, model, config, and active-client tools.
+The next AHP turn creates a new Claude SDK query using that restored context.
+
+The current adapter does not persist Claude SDK private query state. Runtime
+continuity is therefore reconstructed at the AHP session boundary, not by
+restoring an already-running Claude process.
+
 ## Usage
 
 ```ts
