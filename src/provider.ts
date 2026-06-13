@@ -9,6 +9,7 @@ import type {
   AgentSessionContext,
   ActiveClientTools,
   AgentTurnSink,
+  ProviderResumeState,
   ResumableAgentProvider,
   ResumableAgentSessionContext,
 } from '@wyrd-company/ahp-provider-kit';
@@ -54,9 +55,10 @@ export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOpti
     defaultModel,
   });
 
-  function createRuntimeSession(context: AgentSessionContext): AgentSession {
+  function createRuntimeSession(context: AgentSessionContext | ResumableAgentSessionContext): AgentSession {
     const client = options.client ?? options.clientFactory?.() ?? new AnthropicClaudeAgentSdkClient();
     const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
+    const resumeState = resumeStateFromContext(context);
     const activeClientToolsMcpBridge = new ActiveClientToolsMcpBridge({
       name: `${providerId}-active-client-tools`,
       sink: context.activeClientToolSink,
@@ -73,6 +75,7 @@ export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOpti
       mcpServers: options.mcpServers,
       env: options.env,
       activeClientToolsMcpBridge,
+      sessionId: resumeState.sessionId,
     });
   }
 
@@ -87,6 +90,10 @@ export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOpti
   };
 }
 
+interface ClaudeAgentSdkResumeState extends ProviderResumeState {
+  readonly sessionId?: string;
+}
+
 interface ClaudeAgentSdkSessionOptions {
   readonly cwd: string;
   readonly model?: string;
@@ -98,6 +105,7 @@ interface ClaudeAgentSdkSessionOptions {
   readonly mcpServers?: ClaudeAgentSdkOptions['mcpServers'];
   readonly env?: ClaudeAgentSdkOptions['env'];
   readonly activeClientToolsMcpBridge: ActiveClientToolsMcpBridge;
+  readonly sessionId?: string;
 }
 
 class ClaudeAgentSdkAHPAgentSession implements AgentSession {
@@ -105,11 +113,14 @@ class ClaudeAgentSdkAHPAgentSession implements AgentSession {
   private readonly abortController = new AbortController();
   private query?: ClaudeAgentSdkQuery;
   private iterator?: AsyncIterator<ClaudeAgentSdkMessage>;
+  private sessionId?: string;
 
   constructor(
     private readonly client: ClaudeAgentSdkClient,
     private readonly options: ClaudeAgentSdkSessionOptions,
-  ) {}
+  ) {
+    this.sessionId = options.sessionId;
+  }
 
   async sendUserMessage(message: Message, sink: AgentTurnSink, signal: AbortSignal, turnId?: string): Promise<void> {
     const ahpTurnId = turnId ?? `turn-${Date.now()}`;
@@ -144,6 +155,7 @@ class ClaudeAgentSdkAHPAgentSession implements AgentSession {
         }
 
         const sdkMessage = next.value;
+        this.captureSessionId(sdkMessage);
         if (sdkMessage.type === 'stream_event') {
           const delta = streamEventTextDelta(sdkMessage.event);
           if (delta) {
@@ -187,6 +199,10 @@ class ClaudeAgentSdkAHPAgentSession implements AgentSession {
     this.options.activeClientToolsMcpBridge.setActiveClientTools(activeClientTools);
   }
 
+  getResumeState(): ClaudeAgentSdkResumeState | undefined {
+    return this.sessionId ? { sessionId: this.sessionId } : undefined;
+  }
+
   async cancel(): Promise<void> {
     await this.query?.interrupt().catch(() => undefined);
   }
@@ -226,6 +242,7 @@ class ClaudeAgentSdkAHPAgentSession implements AgentSession {
           activeClientTools: activeClientToolsMcpServer,
         },
         ...(this.options.env ? { env: this.options.env } : {}),
+        ...(this.options.sessionId ? { resume: this.options.sessionId } : {}),
         includePartialMessages: true,
       },
     });
@@ -251,6 +268,13 @@ class ClaudeAgentSdkAHPAgentSession implements AgentSession {
         );
       }),
     ]);
+  }
+
+  private captureSessionId(message: ClaudeAgentSdkMessage): void {
+    const sessionId = sessionIdFromMessage(message);
+    if (sessionId) {
+      this.sessionId = sessionId;
+    }
   }
 }
 
@@ -330,6 +354,20 @@ function streamEventTextDelta(event: unknown): string | undefined {
   }
   const delta = event.delta;
   return delta.type === 'text_delta' && typeof delta.text === 'string' ? delta.text : undefined;
+}
+
+function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSessionContext): ClaudeAgentSdkResumeState {
+  if (!('resumeState' in context) || !context.resumeState) {
+    return {};
+  }
+  return typeof context.resumeState.sessionId === 'string'
+    ? { sessionId: context.resumeState.sessionId }
+    : {};
+}
+
+function sessionIdFromMessage(message: ClaudeAgentSdkMessage): string | undefined {
+  const candidate = message as unknown as { session_id?: unknown };
+  return typeof candidate.session_id === 'string' ? candidate.session_id : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

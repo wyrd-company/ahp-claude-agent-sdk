@@ -31,11 +31,9 @@ The provider maps AHP active-client tools to a per-session local Streamable HTTP
 The provider implements `ResumableAgentProvider`. When `ahp-server` reloads a
 persisted AHP session, the adapter recreates the Claude Agent SDK session wrapper
 from the stored AHP working directory, model, config, and active-client tools.
-The next AHP turn creates a new Claude SDK query using that restored context.
-
-The current adapter does not persist Claude SDK private query state. Runtime
-continuity is therefore reconstructed at the AHP session boundary, not by
-restoring an already-running Claude process.
+After the SDK emits a `session_id`, the adapter stores it through the
+provider-owned resume-state hook and passes it back as Claude SDK
+`options.resume` after a server restart.
 
 ## Usage
 

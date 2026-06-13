@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { after, test } from 'node:test';
 
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
-import type { Message, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
+import type { Message, SessionState, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
@@ -75,6 +75,37 @@ test('Claude Agent SDK provider streams SDK messages as AHP actions', async () =
 
   await client.request('disposeSession', { channel: sessionUri });
   await client.shutdown();
+});
+
+test('Claude Agent SDK provider exposes captured SDK session id as resume state', async () => {
+  const claude = new FakeClaudeAgentSdkClient([
+    streamDelta('Claude'),
+    resultSuccess(),
+  ]);
+  const provider = createClaudeAgentSdkProvider({ client: claude, defaultModel: 'claude-test' });
+  const session = await provider.createSession({
+    sessionUri: 'ahp-session:/claude-direct-resume-state',
+    providerId: 'claude-agent-sdk',
+    activeClientToolSink: {
+      async reportInvocation() {
+        throw new Error('not used');
+      },
+    },
+  });
+  const actions: StateAction[] = [];
+
+  await session.sendUserMessage(userMessage('Capture session id'), {
+    emit(action) {
+      actions.push(action);
+    },
+    fail(error) {
+      throw error;
+    },
+  }, new AbortController().signal, 'direct-turn');
+
+  assert.equal(actions.at(-1)?.type, 'session/turnComplete');
+  assert.deepEqual(await session.getResumeState?.(), { sessionId: 'fake-claude-session' });
+  await session.dispose?.();
 });
 
 test('Claude Agent SDK provider exposes active-client tools through Streamable HTTP MCP', async () => {
@@ -169,9 +200,8 @@ test('Claude Agent SDK provider exposes active-client tools through Streamable H
   await client.shutdown();
 });
 
-test('Claude Agent SDK provider resumes a persisted AHP session by recreating its SDK query session', async () => {
+test('Claude Agent SDK provider resumes a persisted AHP session with the SDK session id', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ahp-claude-resume-'));
-  const firstClaude = new FakeClaudeAgentSdkClient([resultSuccess()]);
   const secondClaude = new FakeClaudeAgentSdkClient([
     streamDelta('Resumed '),
     streamDelta('Claude'),
@@ -180,24 +210,16 @@ test('Claude Agent SDK provider resumes a persisted AHP session by recreating it
   const sessionUri = 'ahp-session:/claude-resume';
 
   try {
-    const firstServer = new AhpServer({
-      providers: [createClaudeAgentSdkProvider({ client: firstClaude, defaultModel: 'claude-test' })],
-      store: new FileSystemSessionStore({ directory }),
+    const store = new FileSystemSessionStore({ directory });
+    store.addSession({
+      uri: sessionUri,
+      state: persistedClaudeSessionState(sessionUri),
+      providerResumeState: { sessionId: 'fake-claude-session' },
     });
-    const firstClient = createClient(firstServer);
-    firstClient.connect();
-    await firstClient.initialize({ clientId: 'claude-client', protocolVersions: ['0.3.0'] });
-    await firstClient.request('createSession', {
-      channel: sessionUri,
-      provider: 'claude-agent-sdk',
-      workingDirectory: 'file:///workspaces/project-a',
-      model: { id: 'claude-test' },
-    });
-    await firstClient.shutdown();
 
     const secondServer = new AhpServer({
       providers: [createClaudeAgentSdkProvider({ client: secondClaude, defaultModel: 'claude-test' })],
-      store: new FileSystemSessionStore({ directory }),
+      store,
     });
     const secondClient = createClient(secondServer);
     secondClient.connect();
@@ -221,6 +243,7 @@ test('Claude Agent SDK provider resumes a persisted AHP session by recreating it
     assert.equal(secondClaude.prompts[0], 'Continue after reconnect');
     assert.equal(secondClaude.options[0]?.cwd, '/workspaces/project-a');
     assert.equal(secondClaude.options[0]?.model, 'claude-test');
+    assert.equal(secondClaude.options[0]?.resume, 'fake-claude-session');
     assert.equal(actions.at(-1)?.type, 'session/turnComplete');
 
     await secondClient.request('disposeSession', { channel: sessionUri });
@@ -404,6 +427,24 @@ function userMessage(text: string): Message {
   return {
     text,
     origin: { kind: 'user' as Message['origin']['kind'] },
+  };
+}
+
+function persistedClaudeSessionState(uri: string): SessionState {
+  const now = Date.now();
+  return {
+    summary: {
+      resource: uri,
+      provider: 'claude-agent-sdk',
+      title: 'Persisted Claude Session',
+      status: 1,
+      createdAt: now,
+      modifiedAt: now,
+      workingDirectory: 'file:///workspaces/project-a',
+      model: { id: 'claude-test' },
+    },
+    lifecycle: 'ready' as never,
+    turns: [],
   };
 }
 
