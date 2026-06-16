@@ -1,6 +1,8 @@
 import type {
   AgentInfo,
   Message,
+  StateAction,
+  UsageInfo,
 } from '@microsoft/agent-host-protocol';
 
 import type {
@@ -22,6 +24,7 @@ import {
 } from '@wyrd-company/ahp-provider-kit';
 import {
   AnthropicClaudeAgentSdkClient,
+  type ClaudeAgentSdkContextUsage,
   type ClaudeAgentSdkClient,
   type ClaudeAgentSdkMessage,
   type ClaudeAgentSdkOptions,
@@ -185,6 +188,7 @@ class ClaudeAgentSdkAHPAgentSession implements AgentSession {
           if (!emittedAnyText && sdkMessage.result) {
             emitDelta(sdkMessage.result);
           }
+          sink.emit(await usageAction(query, ahpTurnId));
           markdown.complete();
           return;
         }
@@ -368,6 +372,78 @@ function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSes
 function sessionIdFromMessage(message: ClaudeAgentSdkMessage): string | undefined {
   const candidate = message as unknown as { session_id?: unknown };
   return typeof candidate.session_id === 'string' ? candidate.session_id : undefined;
+}
+
+async function usageAction(query: ClaudeAgentSdkQuery, turnId: string): Promise<StateAction> {
+  return {
+    type: 'session/usage',
+    turnId,
+    usage: await usageInfo(query),
+  } as StateAction;
+}
+
+async function usageInfo(query: ClaudeAgentSdkQuery): Promise<UsageInfo> {
+  try {
+    return measuredUsageInfo(await query.getContextUsage());
+  } catch (error) {
+    return unavailableUsageInfo(error);
+  }
+}
+
+function measuredUsageInfo(contextUsage: ClaudeAgentSdkContextUsage): UsageInfo {
+  const apiUsage = contextUsage.apiUsage ?? undefined;
+  const maxContextWindow = finiteNumber(contextUsage.maxTokens);
+  const totalTokens = finiteNumber(contextUsage.totalTokens);
+  const usageRatio = maxContextWindow && totalTokens !== undefined
+    ? totalTokens / maxContextWindow
+    : percentageRatio(contextUsage.percentage);
+
+  return {
+    inputTokens: finiteNumber(apiUsage?.input_tokens) ?? totalTokens,
+    outputTokens: finiteNumber(apiUsage?.output_tokens),
+    model: typeof contextUsage.model === 'string' ? contextUsage.model : undefined,
+    cacheReadTokens: finiteNumber(apiUsage?.cache_read_input_tokens),
+    _meta: {
+      wyrdContextUsage: {
+        ...(totalTokens !== undefined ? { totalTokens } : {}),
+        ...(maxContextWindow !== undefined ? { maxContextWindow } : {}),
+        ...(usageRatio !== undefined ? { usageRatio } : {}),
+        confidence: 'measured',
+        source: 'provider-api',
+      },
+      claudeAgentSdkContextUsage: {
+        categories: contextUsage.categories,
+        memoryFiles: contextUsage.memoryFiles,
+        mcpTools: contextUsage.mcpTools,
+        deferredBuiltinTools: contextUsage.deferredBuiltinTools,
+        systemTools: contextUsage.systemTools,
+        apiUsage: contextUsage.apiUsage,
+        rawMaxTokens: contextUsage.rawMaxTokens,
+        percentage: contextUsage.percentage,
+      },
+    },
+  };
+}
+
+function unavailableUsageInfo(error: unknown): UsageInfo {
+  return {
+    _meta: {
+      wyrdContextUsage: {
+        confidence: 'unavailable',
+        source: 'unavailable',
+        reason: error instanceof Error ? error.message : String(error),
+      },
+    },
+  };
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function percentageRatio(value: unknown): number | undefined {
+  const percentage = finiteNumber(value);
+  return percentage === undefined ? undefined : percentage / 100;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

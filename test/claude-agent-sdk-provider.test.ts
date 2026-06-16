@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
 
-import { AhpClient } from '@microsoft/agent-host-protocol/client';
-import type { Message, SessionState, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
+import { AhpClient, AhpStateMirror } from '@microsoft/agent-host-protocol/client';
+import type { ActionEnvelope, Message, SessionState, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
 import { Client as McpClient } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
@@ -106,6 +106,80 @@ test('Claude Agent SDK provider exposes captured SDK session id as resume state'
   assert.equal(actions.at(-1)?.type, 'session/turnComplete');
   assert.deepEqual(await session.getResumeState?.(), { sessionId: 'fake-claude-session' });
   await session.dispose?.();
+});
+
+test('Claude Agent SDK provider emits context usage before completed turns', async () => {
+  const contextUsage = claudeContextUsage();
+  const claude = new FakeClaudeAgentSdkClient([
+    streamDelta('Claude'),
+    resultSuccess(),
+  ], Promise.resolve(), contextUsage);
+  const server = new AhpServer({
+    providers: [createClaudeAgentSdkProvider({ client: claude, defaultModel: 'claude-test' })],
+  });
+  const [clientTransport, serverTransport] = createInMemoryTransportPair();
+  runningServers.push(server.accept(serverTransport));
+
+  const client = new AhpClient(clientTransport, { requestTimeoutMs: 1_000 });
+  client.connect();
+  await client.initialize({ clientId: 'usage-client', protocolVersions: ['0.3.0'] });
+
+  const sessionUri = 'ahp-session:/claude-usage';
+  await client.request('createSession', {
+    channel: sessionUri,
+    provider: 'claude-agent-sdk',
+  });
+  const { result, subscription } = await client.subscribe(sessionUri);
+  const mirror = new AhpStateMirror();
+  assert.ok(result.snapshot);
+  mirror.applySnapshot(result.snapshot);
+
+  client.dispatch(sessionUri, {
+    type: 'session/turnStarted',
+    turnId: 'usage-turn',
+    message: userMessage('Report usage'),
+  } as StateAction);
+
+  const actions = await collectUntilTerminal(subscription, envelope => mirror.apply(envelope));
+  const usageIndex = actions.findIndex(action => action.type === 'session/usage');
+  const completeIndex = actions.findIndex(action => action.type === 'session/turnComplete');
+  assert.notEqual(usageIndex, -1);
+  assert.notEqual(completeIndex, -1);
+  assert.ok(usageIndex < completeIndex, `expected usage before completion, saw: ${JSON.stringify(actions)}`);
+
+  const usageAction = actions[usageIndex] as StateAction & { usage: Record<string, unknown> };
+  assert.deepEqual(usageAction.usage, {
+    inputTokens: 42_000,
+    outputTokens: 3_000,
+    model: 'claude-sonnet-4-5',
+    cacheReadTokens: 10_000,
+    _meta: {
+      wyrdContextUsage: {
+        totalTokens: 45_000,
+        maxContextWindow: 200_000,
+        usageRatio: 0.225,
+        confidence: 'measured',
+        source: 'provider-api',
+      },
+      claudeAgentSdkContextUsage: {
+        categories: contextUsage.categories,
+        memoryFiles: contextUsage.memoryFiles,
+        mcpTools: contextUsage.mcpTools,
+        deferredBuiltinTools: contextUsage.deferredBuiltinTools,
+        systemTools: contextUsage.systemTools,
+        apiUsage: contextUsage.apiUsage,
+        rawMaxTokens: contextUsage.rawMaxTokens,
+        percentage: contextUsage.percentage,
+      },
+    },
+  });
+
+  const completedTurn = mirror.getSession(sessionUri)?.turns[0];
+  assert.equal(completedTurn?.id, 'usage-turn');
+  assert.deepEqual(completedTurn?.usage, usageAction.usage);
+
+  await client.request('disposeSession', { channel: sessionUri });
+  await client.shutdown();
 });
 
 test('Claude Agent SDK provider exposes active-client tools through Streamable HTTP MCP', async () => {
@@ -260,11 +334,12 @@ class FakeClaudeAgentSdkClient implements ClaudeAgentSdkClient {
   constructor(
     private readonly messages: readonly ClaudeAgentSdkMessage[],
     private readonly beforeMessages: Promise<void> = Promise.resolve(),
+    private readonly contextUsage?: Awaited<ReturnType<typeof claudeContextUsage>>,
   ) {}
 
   createQuery(params: ClaudeAgentSdkQueryParams): ClaudeAgentSdkQuery {
     this.options.push(params.options);
-    return new FakeClaudeAgentSdkQuery(params.prompt, this.messages, this.prompts, this.beforeMessages);
+    return new FakeClaudeAgentSdkQuery(params.prompt, this.messages, this.prompts, this.beforeMessages, this.contextUsage);
   }
 }
 
@@ -276,6 +351,7 @@ class FakeClaudeAgentSdkQuery implements AsyncGenerator<ClaudeAgentSdkMessage, v
     messages: readonly ClaudeAgentSdkMessage[],
     prompts: string[],
     beforeMessages: Promise<void>,
+    private readonly contextUsage?: Awaited<ReturnType<typeof claudeContextUsage>>,
   ) {
     this.iterator = this.run(prompt, messages, prompts, beforeMessages);
   }
@@ -309,7 +385,12 @@ class FakeClaudeAgentSdkQuery implements AsyncGenerator<ClaudeAgentSdkMessage, v
   async supportedModels(): Promise<never> { throw new Error('not implemented'); }
   async supportedAgents(): Promise<never> { throw new Error('not implemented'); }
   async mcpServerStatus(): Promise<never> { throw new Error('not implemented'); }
-  async getContextUsage(): Promise<never> { throw new Error('not implemented'); }
+  async getContextUsage(): Promise<Awaited<ReturnType<typeof claudeContextUsage>>> {
+    if (!this.contextUsage) {
+      throw new Error('not implemented');
+    }
+    return this.contextUsage;
+  }
   async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(): Promise<never> { throw new Error('not implemented'); }
   async readFile(): Promise<null> { return null; }
   async reloadPlugins(): Promise<never> { throw new Error('not implemented'); }
@@ -367,7 +448,10 @@ async function collectUntilAction(
   assert.fail(`timed out waiting for matching action; saw: ${JSON.stringify(actions)}`);
 }
 
-async function collectUntilTerminal(subscription: AsyncIterator<unknown>): Promise<StateAction[]> {
+async function collectUntilTerminal(
+  subscription: AsyncIterator<unknown>,
+  onAction?: (envelope: ActionEnvelope) => void,
+): Promise<StateAction[]> {
   const actions: StateAction[] = [];
   const deadline = Date.now() + 5_000;
   while (Date.now() < deadline) {
@@ -382,6 +466,7 @@ async function collectUntilTerminal(subscription: AsyncIterator<unknown>): Promi
     if (next.done || value.type !== 'action' || !value.params?.action) {
       continue;
     }
+    onAction?.(value.params as ActionEnvelope);
     actions.push(value.params.action);
     const type = value.params.action.type;
     if (type === 'session/turnComplete' || type === 'session/error') {
@@ -421,6 +506,33 @@ function resultSuccess(): ClaudeAgentSdkMessage {
     uuid: crypto.randomUUID(),
     session_id: 'fake-claude-session',
   } as unknown as ClaudeAgentSdkMessage;
+}
+
+function claudeContextUsage(): Awaited<ReturnType<ClaudeAgentSdkQuery['getContextUsage']>> {
+  return {
+    categories: [
+      { name: 'Messages', tokens: 35_000, color: '#abcdef' },
+      { name: 'Tools', tokens: 10_000, color: '#fedcba' },
+    ],
+    totalTokens: 45_000,
+    maxTokens: 200_000,
+    rawMaxTokens: 200_000,
+    percentage: 22.5,
+    gridRows: [],
+    model: 'claude-sonnet-4-5',
+    memoryFiles: [],
+    mcpTools: [],
+    deferredBuiltinTools: [],
+    systemTools: [],
+    agents: [],
+    isAutoCompactEnabled: true,
+    apiUsage: {
+      input_tokens: 42_000,
+      output_tokens: 3_000,
+      cache_creation_input_tokens: 1_000,
+      cache_read_input_tokens: 10_000,
+    },
+  };
 }
 
 function userMessage(text: string): Message {

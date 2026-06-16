@@ -2,11 +2,13 @@ import {
   query,
   type Options as ClaudeAgentSdkOptions,
   type Query as ClaudeAgentSdkQuery,
+  type SDKControlGetContextUsageResponse as ClaudeAgentSdkContextUsage,
   type SDKMessage as ClaudeAgentSdkMessage,
   type SDKUserMessage as ClaudeAgentSdkUserMessage,
 } from '@anthropic-ai/claude-agent-sdk';
 
 export type {
+  ClaudeAgentSdkContextUsage,
   ClaudeAgentSdkMessage,
   ClaudeAgentSdkOptions,
   ClaudeAgentSdkQuery,

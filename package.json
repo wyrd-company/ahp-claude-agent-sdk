@@ -1,6 +1,6 @@
 {
   "name": "@wyrd-company/ahp-claude-agent-sdk",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Agent Host Protocol provider adapter for Claude Agent SDK.",
   "type": "module",
   "license": "MIT",
