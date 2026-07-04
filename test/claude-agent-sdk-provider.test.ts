@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { after, test } from 'node:test';
 
 import { AhpClient, AhpStateMirror } from '@microsoft/agent-host-protocol/client';
@@ -15,6 +16,12 @@ import {
   createInMemoryTransportPair,
 } from '@wyrd-company/ahp-server';
 import {
+  resolveSessionStorageDir,
+  uriToPath,
+  type AgentSession,
+  type AgentSessionContext,
+} from '@wyrd-company/ahp-provider-kit';
+import {
   createClaudeAgentSdkProvider,
   type ClaudeAgentSdkClient,
   type ClaudeAgentSdkMessage,
@@ -22,6 +29,7 @@ import {
   type ClaudeAgentSdkQueryParams,
   type ClaudeAgentSdkUserMessage,
 } from '../src/index.js';
+import { JsonlSessionStore } from '../src/jsonl-session-store.js';
 
 const runningServers: Array<Promise<void>> = [];
 
@@ -327,6 +335,109 @@ test('Claude Agent SDK provider resumes a persisted AHP session with the SDK ses
   }
 });
 
+test('Claude Agent SDK provider omits sessionStore when sessionStorage is unset', async () => {
+  const claude = new FakeClaudeAgentSdkClient([resultSuccess()]);
+  const provider = createClaudeAgentSdkProvider({ client: claude, defaultModel: 'claude-test' });
+  const session = await provider.createSession(sessionContext('ahp-session:/claude-no-session-storage'));
+
+  try {
+    await sendDirect(session, 'Use SDK defaults');
+
+    assert.equal('sessionStore' in (claude.options[0] ?? {}), false);
+  } finally {
+    await session.dispose?.();
+  }
+});
+
+test('Claude Agent SDK provider passes a JsonlSessionStore for static sessionStorage roots', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-claude-session-storage-'));
+  const sessionStorage = pathToFileURL(directory).href;
+  const context = sessionContext('ahp-session:/claude-static-session-storage');
+  const claude = new FakeClaudeAgentSdkClient([resultSuccess()]);
+  const provider = createClaudeAgentSdkProvider({ client: claude, defaultModel: 'claude-test', sessionStorage });
+  const session = await provider.createSession(context);
+
+  try {
+    await sendDirect(session, 'Use static session storage');
+
+    const store = claude.options[0]?.sessionStore;
+    assert.ok(store instanceof JsonlSessionStore);
+    assert.equal(store.rootDir, uriToPath(resolveSessionStorageDir(sessionStorage, context)!));
+  } finally {
+    await session.dispose?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Claude Agent SDK provider passes a JsonlSessionStore for resolver sessionStorage', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-claude-session-storage-resolver-'));
+  const resolvedUri = pathToFileURL(directory).href;
+  const resolvedSessionUris: string[] = [];
+  const context = sessionContext('ahp-session:/claude-resolver-session-storage');
+  const claude = new FakeClaudeAgentSdkClient([resultSuccess()]);
+  const provider = createClaudeAgentSdkProvider({
+    client: claude,
+    defaultModel: 'claude-test',
+    sessionStorage(candidate) {
+      resolvedSessionUris.push(candidate.sessionUri);
+      return resolvedUri;
+    },
+  });
+  const session = await provider.createSession(context);
+
+  try {
+    await sendDirect(session, 'Use resolver session storage');
+
+    const store = claude.options[0]?.sessionStore;
+    assert.ok(store instanceof JsonlSessionStore);
+    assert.equal(store.rootDir, directory);
+    assert.deepEqual(resolvedSessionUris, [context.sessionUri]);
+  } finally {
+    await session.dispose?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Claude Agent SDK provider resolves the same sessionStorage directory on resume', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-claude-session-storage-resume-'));
+  const sessionStorage = pathToFileURL(directory).href;
+  const sessionUri = 'ahp-session:/claude-session-storage-resume';
+  const createClaude = new FakeClaudeAgentSdkClient([resultSuccess()]);
+  const resumeClaude = new FakeClaudeAgentSdkClient([resultSuccess()]);
+  let clientIndex = 0;
+  const provider = createClaudeAgentSdkProvider({
+    clientFactory() {
+      const client = clientIndex === 0 ? createClaude : resumeClaude;
+      clientIndex += 1;
+      return client;
+    },
+    defaultModel: 'claude-test',
+    sessionStorage,
+  });
+  const created = await provider.createSession(sessionContext(sessionUri));
+  const resumed = await provider.resumeSession({
+    ...sessionContext(sessionUri),
+    state: persistedClaudeSessionState(sessionUri),
+    resumeState: { sessionId: 'fake-claude-session' },
+  });
+
+  try {
+    await sendDirect(created, 'Create with session storage');
+    await sendDirect(resumed, 'Resume with session storage');
+
+    const createStore = createClaude.options[0]?.sessionStore;
+    const resumeStore = resumeClaude.options[0]?.sessionStore;
+    assert.ok(createStore instanceof JsonlSessionStore);
+    assert.ok(resumeStore instanceof JsonlSessionStore);
+    assert.equal(resumeStore.rootDir, createStore.rootDir);
+    assert.equal(resumeClaude.options[0]?.resume, 'fake-claude-session');
+  } finally {
+    await created.dispose?.();
+    await resumed.dispose?.();
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 class FakeClaudeAgentSdkClient implements ClaudeAgentSdkClient {
   readonly prompts: string[] = [];
   readonly options: Array<ClaudeAgentSdkQueryParams['options']> = [];
@@ -400,10 +511,12 @@ class FakeClaudeAgentSdkQuery implements AsyncGenerator<ClaudeAgentSdkMessage, v
   async seedReadState(): Promise<void> {}
   async reconnectMcpServer(): Promise<void> {}
   async toggleMcpServer(): Promise<void> {}
+  async setMcpPermissionModeOverride(): Promise<{ warning?: string }> { return {}; }
   async setMcpServers(): Promise<never> { throw new Error('not implemented'); }
   async streamInput(): Promise<void> {}
   async stopTask(): Promise<void> {}
   async backgroundTasks(): Promise<boolean> { return false; }
+  async reinitialize(): Promise<never> { throw new Error('not implemented'); }
 
   private async *run(
     prompt: string | AsyncIterable<ClaudeAgentSdkUserMessage>,
@@ -573,6 +686,31 @@ function toolDefinition(name: string, title: string): ToolDefinition {
       required: ['query'],
     },
   };
+}
+
+function sessionContext(sessionUri: string): AgentSessionContext {
+  return {
+    sessionUri,
+    providerId: 'claude-agent-sdk',
+    activeClientToolSink: {
+      async reportInvocation() {
+        throw new Error('not used');
+      },
+    },
+  };
+}
+
+async function sendDirect(session: AgentSession, text: string): Promise<StateAction[]> {
+  const actions: StateAction[] = [];
+  await session.sendUserMessage(userMessage(text), {
+    emit(action) {
+      actions.push(action);
+    },
+    fail(error) {
+      throw error;
+    },
+  }, new AbortController().signal, `turn-${actions.length}`);
+  return actions;
 }
 
 function createClient(server: AhpServer): AhpClient {

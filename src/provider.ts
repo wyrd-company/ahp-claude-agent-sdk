@@ -14,10 +14,12 @@ import type {
   ProviderResumeState,
   ResumableAgentProvider,
   ResumableAgentSessionContext,
+  SessionStorage,
 } from '@wyrd-company/ahp-provider-kit';
 import { ActiveClientToolsMcpBridge } from './active-client-tools-mcp-bridge.js';
 import {
   MarkdownTurnEmitter,
+  resolveSessionStorageDir,
   resolveModelId,
   singleModelAgentInfo,
   uriToPath,
@@ -31,6 +33,7 @@ import {
   type ClaudeAgentSdkQuery,
   type ClaudeAgentSdkUserMessage,
 } from './client.js';
+import { JsonlSessionStore } from './jsonl-session-store.js';
 
 export interface ClaudeAgentSdkProviderOptions {
   readonly client?: ClaudeAgentSdkClient;
@@ -46,6 +49,7 @@ export interface ClaudeAgentSdkProviderOptions {
   readonly tools?: ClaudeAgentSdkOptions['tools'];
   readonly mcpServers?: ClaudeAgentSdkOptions['mcpServers'];
   readonly env?: ClaudeAgentSdkOptions['env'];
+  readonly sessionStorage?: SessionStorage;
 }
 
 export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOptions = {}): ResumableAgentProvider {
@@ -67,6 +71,7 @@ export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOpti
       sink: context.activeClientToolSink,
     });
     activeClientToolsMcpBridge.setActiveClientTools(context.activeClientTools);
+    const sessionStorageDir = resolveSessionStorageDir(options.sessionStorage, context);
     return new ClaudeAgentSdkAHPAgentSession(client, {
       cwd,
       model: resolveModelId(context.model, options.defaultModel),
@@ -78,6 +83,7 @@ export function createClaudeAgentSdkProvider(options: ClaudeAgentSdkProviderOpti
       mcpServers: options.mcpServers,
       env: options.env,
       activeClientToolsMcpBridge,
+      sessionStore: sessionStorageDir ? new JsonlSessionStore(uriToPath(sessionStorageDir)) : undefined,
       sessionId: resumeState.sessionId,
     });
   }
@@ -108,6 +114,7 @@ interface ClaudeAgentSdkSessionOptions {
   readonly mcpServers?: ClaudeAgentSdkOptions['mcpServers'];
   readonly env?: ClaudeAgentSdkOptions['env'];
   readonly activeClientToolsMcpBridge: ActiveClientToolsMcpBridge;
+  readonly sessionStore?: ClaudeAgentSdkOptions['sessionStore'];
   readonly sessionId?: string;
 }
 
@@ -246,6 +253,7 @@ class ClaudeAgentSdkAHPAgentSession implements AgentSession {
           activeClientTools: activeClientToolsMcpServer,
         },
         ...(this.options.env ? { env: this.options.env } : {}),
+        ...(this.options.sessionStore ? { sessionStore: this.options.sessionStore } : {}),
         ...(this.options.sessionId ? { resume: this.options.sessionId } : {}),
         includePartialMessages: true,
       },

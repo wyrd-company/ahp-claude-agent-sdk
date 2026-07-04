@@ -11,3 +11,4 @@ export {
   createClaudeAgentSdkProvider,
   type ClaudeAgentSdkProviderOptions,
 } from './provider.js';
+export type { SessionStorage } from '@wyrd-company/ahp-provider-kit';
