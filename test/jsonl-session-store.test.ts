@@ -88,6 +88,15 @@ test('JsonlSessionStore deletes sessions best effort', async () => {
   assert.deepEqual(await store.listSessions('project-a'), []);
 });
 
+test('load finds content written under a different projectKey for the same session', async () => {
+  const store = new JsonlSessionStore(directory);
+  const written = [entry('user', 'uuid-1'), entry('assistant', 'uuid-2')];
+  await store.append({ projectKey: '/old/workspace/path', sessionId: 'session-1' }, written);
+
+  const loaded = await store.load({ projectKey: '/new/workspace/path', sessionId: 'session-1' });
+  assert.deepEqual(loaded, written);
+});
+
 function sessionKey(sessionId: string): SessionKey {
   return {
     projectKey: 'project-a',

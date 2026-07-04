@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { appendFile, mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 
@@ -52,9 +51,8 @@ export class JsonlSessionStore implements SessionStore {
       .map(line => JSON.parse(line) as SessionStoreEntry);
   }
 
-  async listSessions(projectKey: string): Promise<Array<{ sessionId: string; mtime: number }>> {
-    const projectDir = this.projectDir(projectKey);
-    const entries = await readdir(projectDir, { withFileTypes: true }).catch(error => {
+  async listSessions(_projectKey: string): Promise<Array<{ sessionId: string; mtime: number }>> {
+    const entries = await readdir(this.rootDir, { withFileTypes: true }).catch(error => {
       if (isNodeErrorCode(error, 'ENOENT')) {
         return [];
       }
@@ -65,7 +63,7 @@ export class JsonlSessionStore implements SessionStore {
       if (!entry.isDirectory() || !entry.name.startsWith('session-')) {
         continue;
       }
-      const file = join(projectDir, entry.name, 'main.jsonl');
+      const file = join(this.rootDir, entry.name, 'main.jsonl');
       const fileStat = await stat(file).catch(error => {
         if (isNodeErrorCode(error, 'ENOENT')) {
           return undefined;
@@ -85,12 +83,12 @@ export class JsonlSessionStore implements SessionStore {
   async delete(key: SessionKey): Promise<void> {
     const target = key.subpath
       ? this.fileForKey(key)
-      : this.sessionDir(key.projectKey, key.sessionId);
+      : this.sessionDir(key.sessionId);
     await rm(target, { recursive: true, force: true });
   }
 
   async listSubkeys(key: { projectKey: string; sessionId: string }): Promise<string[]> {
-    const dir = join(this.sessionDir(key.projectKey, key.sessionId), 'subpaths');
+    const dir = join(this.sessionDir(key.sessionId), 'subpaths');
     const entries = await readdir(dir, { withFileTypes: true }).catch(error => {
       if (isNodeErrorCode(error, 'ENOENT')) {
         return [];
@@ -130,20 +128,24 @@ export class JsonlSessionStore implements SessionStore {
   private fileForKey(key: SessionKey): string {
     if (key.subpath) {
       return join(
-        this.sessionDir(key.projectKey, key.sessionId),
+        this.sessionDir(key.sessionId),
         'subpaths',
         `${encodePathSegment(key.subpath)}.jsonl`,
       );
     }
-    return join(this.sessionDir(key.projectKey, key.sessionId), 'main.jsonl');
+    return join(this.sessionDir(key.sessionId), 'main.jsonl');
   }
 
-  private sessionDir(projectKey: string, sessionId: string): string {
-    return join(this.projectDir(projectKey), `session-${encodePathSegment(sessionId)}`);
-  }
-
-  private projectDir(projectKey: string): string {
-    return join(this.rootDir, `project-${createHash('sha256').update(projectKey).digest('hex')}`);
+  // Content is keyed by sessionId ONLY, never projectKey: the SDK derives the
+  // default projectKey from the session's sanitized cwd, so a session resumed
+  // from a different workspace path presents a different projectKey for the
+  // same sessionId. Folding projectKey into the layout would break the
+  // provider-kit contract that the directory plus the resume handle suffice on
+  // a different machine or path. Session ids are UUIDs, so cross-project
+  // collisions are not a practical concern; listSessions consequently lists
+  // every session under the root regardless of the projectKey argument.
+  private sessionDir(sessionId: string): string {
+    return join(this.rootDir, `session-${encodePathSegment(sessionId)}`);
   }
 }
 
